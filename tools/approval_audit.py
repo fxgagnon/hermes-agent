@@ -5,6 +5,7 @@ arguments, output, denial reason, room ID or credentials enter this schema.
 A single gateway owns writes; retention is two 1 MiB segments per profile.
 """
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -44,7 +45,7 @@ def record(relay, event, *, request_id='', choice='', issuer='', status=''):
         row['execution_effect'] = 'unknown'
     data = (json.dumps(row, separators=(',', ':')) + '\n').encode()
     with _lock:
-        if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
+        if inspect.unwrap(os.open) not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
             raise OSError('Secure audit storage requires descriptor-relative file operations')
         dfd = os.open(relay.audit_home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:

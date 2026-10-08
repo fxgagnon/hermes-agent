@@ -73,7 +73,7 @@ def test_real_dispatch_evidence_is_private_and_not_execution_permission(tmp_path
         A.clear_session(key)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_audit_rejects_symlink_without_creating_files_outside_home(tmp_path):
     from types import SimpleNamespace
     from tools.approval_audit import record
