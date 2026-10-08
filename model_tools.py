@@ -828,9 +828,11 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
         from tools.connectors import dispatch_connector_call, is_connector_name
-        if is_connector_name(function_name):
-            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        from tools.approval_audit import observe_dispatch
+        with observe_dispatch(ids.tool_call_id, function_name):
+            if is_connector_name(function_name):
+                return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
+            return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

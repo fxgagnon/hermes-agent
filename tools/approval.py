@@ -126,12 +126,21 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
-def unregister_gateway_notify(session_key: str) -> None:
-    """Unregister the callback and wake ALL blocked threads for this session so
-    they don't hang forever (agent run finished or interrupted)."""
+def unregister_gateway_notify(session_key: str, *, expected_cb=None) -> None:
+    """Release a turn notifier, not independently-owned detached requests.
+
+    ``expected_cb`` prevents an old turn's finally from removing a newer turn.
+    Session termination uses ``clear_session`` to revoke detached relays too.
+    """
     with _lock:
+        if expected_cb is not None and _gateway_notify_cbs.get(session_key) != expected_cb:
+            return
         _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        queue = _gateway_queues.get(session_key, [])
+        entries = [e for e in queue if e.relay is None]
+        queue[:] = [e for e in queue if e.relay is not None]
+        if not queue:
+            _gateway_queues.pop(session_key, None)
     for entry in entries:
         entry.event.set()
 
@@ -139,7 +148,7 @@ def unregister_gateway_notify(session_key: str) -> None:
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None, *, issuer: Optional[str] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
@@ -150,8 +159,17 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        if not request_id and any(e.relay is not None for e in queue):
+            # A session-wide FIFO/all decision cannot identify the child operation.
+            return 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+            import time
+            targets = [entry for entry in targets if entry.relay is None or (
+                not entry.relay.closed and time.monotonic() < entry.deadline
+                and choice in ('once', 'deny', 'session', 'always')
+                and (choice != 'session' or entry.data.get('allow_session', True))
+                and (choice != 'always' or entry.data.get('allow_permanent', True)))]
             if not targets:
                 return 0
             queue[:] = [entry for entry in queue if entry not in targets]
@@ -163,11 +181,17 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if not queue:
             _gateway_queues.pop(session_key, None)
 
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
+        for entry in targets:
+            from tools.approval_audit import record
+            try:
+                record(entry.relay, 'decision', request_id=entry.data['request_id'], choice=choice, issuer=issuer)
+            except (OSError, ValueError):
+                entry.result = 'deny'
+            else:
+                entry.result = choice
+            if reason:
+                entry.reason = reason
+            entry.event.set()
     return len(targets)
 
 
@@ -263,6 +287,9 @@ def clear_session(session_key: str) -> None:
     if not session_key:
         return
     with _lock:
+        from tools.approval_relay import revoke_session_locked
+        revoke_session_locked(session_key)
+        _gateway_notify_cbs.pop(session_key, None)
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
@@ -514,6 +541,10 @@ def _user_approved(session_key: str, description: str) -> dict:
 
 
 def _gateway_notify_cb(session_key: str):
+    from tools.approval_relay import current_relay
+    relay = current_relay(session_key)
+    if relay is not None:
+        return relay
     with _lock:
         return _gateway_notify_cbs.get(session_key)
 

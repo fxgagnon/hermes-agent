@@ -1375,8 +1375,20 @@ class TurnRunner:
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
-        adapter.pause_typing_for_chat(ctx._status_chat_id)
-        self._close_native_stream_boundary("Approval")
+        if approval_data.get("delegation_id") and not getattr(type(adapter), "supports_correlated_exec_approval", False):
+            raise RuntimeError("Detached approvals require a correlated, requester-bound adapter")
+        if not approval_data.get("delegation_id"):
+            adapter.pause_typing_for_chat(ctx._status_chat_id)
+            self._close_native_stream_boundary("Approval")
+        approval_metadata = {**(ctx._status_thread_metadata or {}),
+                             "approval_request_id": approval_data.get("request_id")}
+        if approval_data.get("delegation_id"):
+            # Source comes from the gateway turn, never child-provided routing data.
+            requester = getattr(ctx.source, "user_id", None)
+            if not requester:
+                raise RuntimeError("Detached approval has no trusted requester")
+            approval_metadata["requester_user_id"] = requester
+            approval_metadata["approval_delegation_id"] = approval_data["delegation_id"]
         # Redact credentials before display: Tirith's findings are already redacted, but the raw
         # command string still leaks secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
@@ -1388,7 +1400,7 @@ class TurnRunner:
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        description=desc, metadata=approval_metadata, **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )
@@ -1398,9 +1410,10 @@ class TurnRunner:
                 if outcome == "sent":
                     # Without this, a card whose timer runs out keeps live buttons and nobody
                     # learns the command did NOT run (only the TUI registered a settle hook).
-                    register_timeout_notice(
-                        self, approval_data, command=cmd,
-                        card_message_id=getattr(fut.result(timeout=0), "message_id", None))
+                    if not approval_data.get("delegation_id"):
+                        register_timeout_notice(
+                            self, approval_data, command=cmd,
+                            card_message_id=getattr(fut.result(timeout=0), "message_id", None))
                     return
                 if outcome == "ambiguous":
                     # Timeout ≠ failure: the card may have posted with a late ack. The prompt
@@ -1447,6 +1460,8 @@ class TurnRunner:
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
+        if approval_data.get("delegation_id"):
+            raise RuntimeError("Detached approval card unavailable; refusing uncorrelated text fallback")
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
         try:
             # Mark as approval prompt so WeCom routes through the control lane.
@@ -1621,7 +1636,7 @@ class TurnRunner:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             return agent.run_conversation(api_message, **kwargs)
         finally:
-            unregister_gateway_notify(session_key)
+            unregister_gateway_notify(session_key, expected_cb=self._approval_notify_sync)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):

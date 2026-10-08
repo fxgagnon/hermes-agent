@@ -338,6 +338,9 @@ class _MatrixApprovalPrompt:
     session_key: str
     chat_id: str
     message_id: str
+    request_id: str | None = None
+    detached: bool = False
+    allowed_choices: tuple = ("once", "session", "always", "deny")
     resolved: bool = False
     requester_user_id: str | None = None
     expires_at: float | None = None
@@ -804,6 +807,7 @@ class _CryptoStateStore:
 class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
+    supports_correlated_exec_approval = True
     supports_code_blocks = True  # Matrix renders fenced code blocks (HTML/markdown)
     splits_long_messages = True  # send() chunks via truncate_message(max_message_length)
     typed_command_prefix = "!"  # clients reserve typed "/" for local commands; "!command" always reaches Hermes
@@ -1647,15 +1651,35 @@ class MatrixAdapter(BasePlatformAdapter):
         session_key, chat_id = prompt.session_key, prompt.chat_id
 
         def _make(message_id, requester, expires_at):
-            old_event = self._approval_prompt_by_session.get(session_key)
-            if old_event:
-                self._approval_prompts_by_event.pop(old_event, None)
             self._approval_prompt_by_session[session_key] = message_id
             return _MatrixApprovalPrompt(
                 session_key=session_key, chat_id=chat_id, message_id=message_id, requester_user_id=requester,
+                request_id=(prompt.metadata or {}).get("approval_request_id"),
+                detached=bool((prompt.metadata or {}).get("approval_delegation_id")),
+                allowed_choices=tuple(choices),
                 expires_at=expires_at)
-        return await self._send_reaction_prompt(
+        result = await self._send_reaction_prompt(
             chat_id, text, prompt.metadata, _make, self._approval_prompts_by_event, reactions, "approval")
+        if (prompt.metadata or {}).get("approval_delegation_id") and result.success and result.message_id:
+            from tools.approval import register_gateway_settle
+            loop = asyncio.get_running_loop()
+            def settle(reason):
+                loop.call_soon_threadsafe(self._withdraw_detached_approval, result.message_id)
+            if not register_gateway_settle(session_key, prompt.metadata["approval_request_id"], settle):
+                self._withdraw_detached_approval(result.message_id)
+        return result
+
+    def _withdraw_detached_approval(self, message_id):
+        """Run on the adapter loop, even after the originating turn has returned."""
+        prompt = self._approval_prompts_by_event.pop(message_id, None)
+        if prompt is None:
+            return
+        prompt.resolved = True
+        if self._approval_prompt_by_session.get(prompt.session_key) == message_id:
+            self._approval_prompt_by_session.pop(prompt.session_key, None)
+        task = asyncio.create_task(self._redact_bot_approval_reactions(prompt.chat_id, prompt))
+        self._reaction_redaction_tasks.add(task)
+        task.add_done_callback(self._reaction_redaction_tasks.discard)
 
     async def send_model_picker(
         self, chat_id: str, providers: list, current_model: str, current_provider: str, session_key: str,
@@ -2361,19 +2385,26 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _handle_approval_reaction(self, room_id: str, reacts_to: str, key: str, sender: str) -> bool:
         """Resolve a pending exec-approval prompt from a reaction. True if it was the target."""
+        candidate = self._approval_prompts_by_event.get(reacts_to)
+        if candidate and candidate.detached and (not candidate.requester_user_id or sender != candidate.requester_user_id):
+            return True
         handled, prompt, choice = await self._claim_reaction_prompt(
             self._approval_prompts_by_event, room_id, reacts_to, key, sender, "approval",
             "That reaction is not valid for this approval prompt.", self._expire_matrix_approval_prompt,
             choices=self._approval_reaction_map)
         if choice is None:
             return handled
+        if not prompt.request_id or choice not in prompt.allowed_choices:
+            return True  # Never resolve a different operation through a session FIFO.
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(prompt.session_key, choice)
+            count = resolve_gateway_approval(prompt.session_key, choice, request_id=prompt.request_id,
+                                             issuer=sender)
             if count:
                 prompt.resolved = True
                 self._approval_prompts_by_event.pop(reacts_to, None)
-                self._approval_prompt_by_session.pop(prompt.session_key, None)
+                if self._approval_prompt_by_session.get(prompt.session_key) == reacts_to:
+                    self._approval_prompt_by_session.pop(prompt.session_key, None)
                 logger.info(
                     "Matrix reaction resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, prompt.session_key, choice, sender)

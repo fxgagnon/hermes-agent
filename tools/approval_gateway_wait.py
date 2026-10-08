@@ -24,11 +24,13 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "relay", "deadline")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = dict(data)
+        self.relay = None
+        self.deadline: float | None = None
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         # Surface hook run once when the wait ends by ANY path (answer, timeout, interrupt, /approve from
@@ -129,9 +131,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "session_key": session_key, "surface": surface,
     }
     keys = list(approval_data.get("pattern_keys") or [])
+    from tools.approval_relay import current_relay
+    relay = current_relay(session_key)
     with _approval._lock:
         leader = next((e for e in _approval._gateway_queues.get(session_key, [])
-                       if e.data.get("command") == approval_data.get("command")
+                       if relay is None and e.relay is None
+                       and e.data.get("command") == approval_data.get("command")
                        and list(e.data.get("pattern_keys") or []) == keys), None)
     if leader is not None:
         adopted = _await_coalesced_leader(session_key, leader, payload)
@@ -139,10 +144,15 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             return adopted
 
     entry = _ApprovalEntry(approval_data)
+    entry.relay = relay
+    if relay is not None:
+        entry.deadline = time.monotonic() + max(_ctx._get_approval_timeout(), 0)
     with _approval._lock:
+        if relay is not None and relay.closed:
+            return {"resolved": True, "choice": "deny", "reason": None}
         _approval._gateway_queues.setdefault(session_key, []).append(entry)
 
-    def _drop_entry(reason: str) -> None:
+    def _drop_entry(reason: str):
         with _approval._lock:
             queue = _approval._gateway_queues.get(session_key, [])
             if entry in queue:
@@ -150,20 +160,28 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             if not queue:
                 _approval._gateway_queues.pop(session_key, None)
             settle, entry.settle = entry.settle, None
+            choice = entry.result
+            if choice is not None and reason == 'timeout':
+                reason = 'answered'
         if settle is not None:
             try:
                 settle(reason)
             except Exception:
                 logger.debug("approval settle hook failed", exc_info=True)
+        return choice
 
     # Plugins hear about the request before the gateway does (real-time observers).
     _ctx._fire_approval_hook("pre_approval_request", **payload)
     # Bridges sync agent thread → async gateway.
     try:
+        from tools.approval_audit import record
+        record(relay, 'request', request_id=entry.data['request_id'])
         notify_cb(dict(entry.data))
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry("notify_failed")
+        from tools.approval_audit import best_effort
+        best_effort(relay, 'settled', request_id=entry.data['request_id'], status='notify_failed')
         _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
         return {"resolved": False, "choice": None, "notify_failed": True}
 
@@ -172,5 +190,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     if state == "interrupted":
         entry.result = "deny"
         entry.event.set()
-    _drop_entry("answered" if state == "set" else state)
-    return _finish(payload, state != "timeout", entry.result, entry.reason)
+    choice = _drop_entry("answered" if state == "set" else state)
+    if state == 'interrupted':
+        # A concurrent resolver may have replaced entry.result before cleanup.
+        # The interrupted waiter must deny regardless of that shared choice.
+        choice = 'deny'
+    if choice is not None and state == 'timeout':
+        state = 'set'
+    from tools.approval_audit import best_effort
+    best_effort(relay, 'settled', request_id=entry.data['request_id'],
+                status='closed' if relay is not None and relay.closed else state)
+    return _finish(payload, state != "timeout", choice, entry.reason)
