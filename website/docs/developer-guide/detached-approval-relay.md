@@ -47,12 +47,14 @@ Retention is one current and one previous segment, each targeted at 1 MiB.
 Rotation assumes a single gateway writer per profile, with an in-process lock;
 it is not a multiprocess journal, tamper-proof ledger or permission store.
 The profile home and its ancestors must be trusted. Secure storage requires
-POSIX descriptor-relative operations and `O_NOFOLLOW`; unsupported storage fails
-closed for pre-execution evidence. Disk latency can delay approval operations.
+POSIX descriptor-relative operations and `O_NOFOLLOW`; unsupported storage (for
+example Windows) fails closed for approvals: a detached child's dangerous command
+is never approved there. Disk latency can delay approval operations.
 
-Request/dispatch evidence failures prevent that operation from proceeding;
-decision write failure produces deny. Post-execution/closure evidence is
-best effort and reports incomplete evidence without recording payloads. A handler
+Request evidence failure prevents the approval prompt (`notify_failed`); decision
+write failure produces deny. Dispatch, post-execution and closure evidence is
+best effort: it never blocks a tool that needs no approval, and a failed write
+reports incomplete evidence without recording payloads. A handler
 return is recorded with `execution_effect: unknown`: neither a return nor an
 approval proves that an external operation succeeded. Existing gateway logs,
 transcripts and Matrix message content have separate privacy/retention policies;

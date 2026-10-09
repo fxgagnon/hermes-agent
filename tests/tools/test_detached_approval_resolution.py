@@ -72,7 +72,9 @@ def test_detached_evidence_is_written_outside_the_approval_lock(waits, monkeypat
             held.append((event, A._lock.locked()))
         return real(relay, event, **fields)
     monkeypatch.setattr(approval_audit, 'record', spy)
-    _, notice, _, t = waits('deleg_answered')
+    # Hold every relay: the registry is a WeakSet, so an unreferenced answered relay may be
+    # collected before clear_session and skip its relay_closed row.
+    answered, notice, _, t = waits('deleg_answered')
     closing, _, _, _ = waits('deleg_closed')
     assert A.resolve_gateway_approval(KEY, 'once', request_id=notice['request_id']) == 1
     closing.close()
@@ -84,4 +86,4 @@ def test_detached_evidence_is_written_outside_the_approval_lock(waits, monkeypat
     # clear_session revokes the answered and the still-waiting relay alike.
     assert sorted(event for event, _ in held) == ['decision'] + ['relay_closed'] * 3
     assert not any(locked for _, locked in held)
-    assert revoked.closed
+    assert answered.closed and revoked.closed

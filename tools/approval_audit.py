@@ -98,7 +98,9 @@ def observe_dispatch(tool_call_id, tool_name):
     token = _tool_call.set(tool_call_id or '')
     name_token = _tool_name.set(tool_name if re.fullmatch(r'[a-zA-Z0-9_]{1,64}', tool_name) else 'other')
     try:
-        record(relay, 'tool_dispatch')
+        # Observation, not permission: approvals are gated by request/decision evidence, so an
+        # unwritable dispatch row (e.g. a platform without dir-fd/O_NOFOLLOW) must not stop every tool.
+        best_effort(relay, 'tool_dispatch')
         try:
             yield
         except BaseException:

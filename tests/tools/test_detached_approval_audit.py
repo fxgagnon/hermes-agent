@@ -85,3 +85,40 @@ def test_audit_rejects_symlink_without_creating_files_outside_home(tmp_path):
     with pytest.raises(OSError):
         record(relay, 'request')
     assert not list(outside.iterdir())
+
+
+def test_unsupported_audit_storage_blocks_approvals_not_ordinary_tools(tmp_path, monkeypatch):
+    """Platforms without dir-fd/O_NOFOLLOW (Windows) still run a detached child's ordinary tools."""
+    from model_tools import handle_function_call, registry
+    from tools import approval_audit
+
+    key = 'fixture-unsupported-audit'
+    notified = []
+    A.register_gateway_notify(key, notified.append)
+    monkeypatch.setattr('hermes_constants.get_hermes_home', lambda: tmp_path)
+    relay = capture_relay(key, 'deleg_fixture')
+    A.unregister_gateway_notify(key)
+    monkeypatch.setattr(approval_audit.os, 'supports_dir_fd', set())
+    called, decisions = [], []
+
+    def plain(args, **kwargs):
+        called.append(True)
+        return '{}'
+
+    def dangerous(args, **kwargs):
+        decisions.append(_await_gateway_decision(key, A._gateway_notify_cb(key), {'command': 'fixture'}))
+        return '{}'
+
+    registry.register(name='audit_plain_fixture', toolset='fixture', schema={'name': 'audit_plain_fixture'},
+                      handler=plain)
+    registry.register(name='audit_dangerous_fixture', toolset='fixture',
+                      schema={'name': 'audit_dangerous_fixture'}, handler=dangerous)
+    try:
+        run_with_relay(relay, lambda: handle_function_call('audit_plain_fixture', {}))
+        run_with_relay(relay, lambda: handle_function_call('audit_dangerous_fixture', {}))
+        assert called == [True]
+        assert decisions[0].get('notify_failed') and not notified
+        assert not (tmp_path / 'logs').exists()
+    finally:
+        relay.close()
+        A.clear_session(key)
