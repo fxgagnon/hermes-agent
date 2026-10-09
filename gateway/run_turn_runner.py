@@ -26,6 +26,9 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.run_turn_runner_approval_card import (
+    _ExecApprovalDeclined, _renders_exec_approval_buttons, approval_card_metadata,
+)
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -49,30 +52,10 @@ _CARD_DESTINATION_REFUSALS = {
 }
 
 
-def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
-    """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
-    say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
-    duck types) counts when it defines ``send_exec_approval`` itself."""
-    probe = getattr(adapter_cls, "supports_exec_approval_buttons", None)
-    if callable(probe) and issubclass(adapter_cls, BasePlatformAdapter):
-        return bool(probe())
-    return getattr(adapter_cls, "send_exec_approval", None) is not None
-
-
 # Rendered on a native clarify card whose wait ended without a click (mirrors the notice the
 # Slack click handler shows on a dead entry).
 def _clarify_expired_notice() -> str:
     return t("gateway.clarify.expired")
-
-
-class _ExecApprovalDeclined(RuntimeError):
-    """The connector refused the approval card's destination.
-
-    Raised (not returned) so it propagates out of `_approval_notify_sync` to
-    `_await_gateway_decision`, whose notify-failure path drops the central
-    approval queue entry and unblocks the waiting tool. A plain return
-    suppressed the text fallback but left that entry pending.
-    """
 
 
 class TurnRunner:
@@ -1459,23 +1442,14 @@ class TurnRunner:
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
         adapter = ctx._status_adapter
+        approval_metadata = approval_card_metadata(ctx, adapter, approval_data)
+        detached = bool(approval_data.get("delegation_id"))
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
-        # in approve/deny.
-        if approval_data.get("delegation_id") and not getattr(type(adapter), "supports_correlated_exec_approval", False):
-            raise RuntimeError("Detached approvals require a correlated, requester-bound adapter")
-        if not approval_data.get("delegation_id"):
+        # in approve/deny. A detached approval belongs to no live turn, so it leaves typing alone.
+        if not detached:
             adapter.pause_typing_for_chat(ctx._status_chat_id)
             self._close_native_stream_boundary("Approval")
-        approval_metadata = {**(ctx._status_thread_metadata or {}),
-                             "approval_request_id": approval_data.get("request_id")}
-        if approval_data.get("delegation_id"):
-            # Source comes from the gateway turn, never child-provided routing data.
-            requester = getattr(ctx.source, "user_id", None)
-            if not requester:
-                raise RuntimeError("Detached approval has no trusted requester")
-            approval_metadata["requester_user_id"] = requester
-            approval_metadata["approval_delegation_id"] = approval_data["delegation_id"]
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = approval_data.get("description") or ea_default_reason_text()
@@ -1496,7 +1470,7 @@ class TurnRunner:
                 if outcome == "sent":
                     # Without this, a card whose timer runs out keeps live buttons and nobody
                     # learns the command did NOT run (only the TUI registered a settle hook).
-                    if not approval_data.get("delegation_id"):
+                    if not detached:
                         register_timeout_notice(
                             self, approval_data, command=cmd,
                             card_message_id=getattr(fut.result(timeout=0), "message_id", None))
@@ -1546,7 +1520,7 @@ class TurnRunner:
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
-        if approval_data.get("delegation_id"):
+        if detached:
             raise RuntimeError("Detached approval card unavailable; refusing uncorrelated text fallback")
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
         try:
