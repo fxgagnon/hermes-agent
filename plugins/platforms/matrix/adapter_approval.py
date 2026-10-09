@@ -37,19 +37,26 @@ class MatrixApprovalMixin:
             f"{t('platform.matrix.approval.legend_intro')}\n" + "\n".join(t(self._EA_LEGEND_KEYS[c]) for c in choices))
         reactions = tuple(self._EA_REACTIONS[c] for c in choices)
         session_key, chat_id = prompt.session_key, prompt.chat_id
+        detached = bool((prompt.metadata or {}).get("approval_delegation_id"))
 
         def _make(message_id, requester, expires_at):
-            self._approval_prompt_by_session[session_key] = message_id
+            # The turn's newest card supersedes its previous one; detached cards are withdrawn
+            # by their own settle hook and never take or evict the turn's slot.
+            if not detached:
+                old_event = self._approval_prompt_by_session.get(session_key)
+                if old_event:
+                    self._approval_prompts_by_event.pop(old_event, None)
+                self._approval_prompt_by_session[session_key] = message_id
             from plugins.platforms.matrix.adapter import _MatrixApprovalPrompt
             return _MatrixApprovalPrompt(
                 session_key=session_key, chat_id=chat_id, message_id=message_id, requester_user_id=requester,
                 request_id=(prompt.metadata or {}).get("approval_request_id"),
-                detached=bool((prompt.metadata or {}).get("approval_delegation_id")),
+                detached=detached,
                 allowed_choices=tuple(choices),
                 expires_at=expires_at)
         result = await self._send_reaction_prompt(
             chat_id, text, prompt.metadata, _make, self._approval_prompts_by_event, reactions, "approval")
-        if (prompt.metadata or {}).get("approval_delegation_id") and result.success and result.message_id:
+        if detached and result.success and result.message_id:
             from tools.approval import register_gateway_settle
             loop = asyncio.get_running_loop()
             def settle(reason):
