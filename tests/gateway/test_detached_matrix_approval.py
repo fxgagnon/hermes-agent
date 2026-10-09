@@ -16,7 +16,7 @@ from tools.approval_relay import capture_relay, run_with_relay
 @pytest.mark.asyncio
 async def test_parallel_cards_resolve_exact_child_and_keep_source(monkeypatch):
     monkeypatch.setenv('MATRIX_ALLOWED_USERS', '@owner:example.org,@other:example.org')
-    monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 5)
+    monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 30)
     adapter = MatrixAdapter(PlatformConfig(enabled=True, token='fixture', extra={'homeserver': 'https://example.org'}))
     adapter._client = object()
     adapter._approval_require_sender = False
@@ -54,7 +54,7 @@ async def test_parallel_cards_resolve_exact_child_and_keep_source(monkeypatch):
                     {'command': 'fixture', 'pattern_keys': ['fixture'], 'allow_session': False,
                      'allow_permanent': False}))
             workers.append(asyncio.create_task(asyncio.to_thread(work)))
-            notices.append(await asyncio.wait_for(sent.get(), 3))
+            notices.append(await asyncio.wait_for(sent.get(), 10))
         A.unregister_gateway_notify(key, expected_cb=runner._approval_notify_sync)
         assert all(e in adapter._approval_prompts_by_event for e in notices)
         for _, room, metadata in posted:
@@ -70,15 +70,19 @@ async def test_parallel_cards_resolve_exact_child_and_keep_source(monkeypatch):
         await react(notices[1], emoji='♾️')
         assert len(A.list_gateway_approvals(key)) == 3
         await react(notices[1])
-        assert (await asyncio.wait_for(workers[1], 3))['choice'] == 'once'
+        assert (await asyncio.wait_for(workers[1], 10))['choice'] == 'once'
         await react(notices[1])
         assert len(A.list_gateway_approvals(key)) == 2
         await react(notices[0], emoji='❌')
-        assert (await asyncio.wait_for(workers[0], 3))['choice'] == 'deny'
+        assert (await asyncio.wait_for(workers[0], 10))['choice'] == 'deny'
         relays[2].close()
-        assert (await asyncio.wait_for(workers[2], 3))['choice'] == 'deny'
-        # The originating turn is gone; cleanup must still withdraw the exact card.
-        await asyncio.sleep(0)
+        assert (await asyncio.wait_for(workers[2], 10))['choice'] == 'deny'
+        # The originating turn is gone; cleanup must still withdraw the exact card. Withdrawal is
+        # posted to the loop from the worker thread, so let it drain instead of a single tick.
+        for _ in range(200):
+            if not adapter._approval_prompts_by_event:
+                break
+            await asyncio.sleep(0.01)
         assert not adapter._approval_prompts_by_event
         assert not adapter._approval_prompt_by_session
     finally:

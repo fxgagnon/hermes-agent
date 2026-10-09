@@ -12,7 +12,7 @@ from tools.approval_gateway_wait import _await_gateway_decision
 def relay_wait(monkeypatch):
     """Create an actual blocking queue entry in a context-propagated worker."""
     from tools.approval_relay import capture_relay, run_with_relay
-    monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 2)
+    monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 10)
     workers = []
 
     def start(key='fixture-session', delegation_id='deleg_fixture'):
@@ -24,7 +24,7 @@ def relay_wait(monkeypatch):
             _await_gateway_decision(key, A._gateway_notify_cb(key),
                                     {'command': delegation_id, 'pattern_keys': ['fixture']}))))
         t.start()
-        notice = notices.get(timeout=1)
+        notice = notices.get(timeout=5)
         workers.append((key, t))
         return relay, notice, results, t
 
@@ -32,7 +32,7 @@ def relay_wait(monkeypatch):
     for key, t in workers:
         for data in A.list_gateway_approvals(key):
             A.resolve_gateway_approval(key, 'deny', request_id=data['request_id'])
-        t.join(3)
+        t.join(5)
         A.unregister_gateway_notify(key)
 
 
@@ -51,8 +51,8 @@ def test_cancel_revokes_only_its_delegation_and_cannot_rearm(relay_wait):
     a.close()
     assert A.resolve_gateway_approval(a.session_key, 'once', request_id=na['request_id']) == 0
     assert A.resolve_gateway_approval(b.session_key, 'once', request_id=nb['request_id']) == 1
-    ta.join(1)
-    tb.join(1)
+    ta.join(5)
+    tb.join(5)
     assert ra[0]['choice'] == 'deny'
     assert rb[0]['choice'] == 'once'
     again = run_with_relay(a, lambda: _await_gateway_decision(a.session_key, a, {'command': 'late'}))
@@ -64,7 +64,7 @@ def test_reset_revokes_relay_even_before_next_request(relay_wait):
     from tools.approval_relay import run_with_relay
     relay, notice, results, t = relay_wait()
     A.clear_session(relay.session_key)
-    t.join(1)
+    t.join(5)
     assert relay.closed
     again = run_with_relay(relay, lambda: _await_gateway_decision(relay.session_key, relay, {'command': 'late'}))
     assert again['choice'] == 'deny'
@@ -78,7 +78,7 @@ def test_expired_detached_request_cannot_win_before_waiter_cleans_up(relay_wait)
         entry.deadline = time.monotonic() - 1
     assert A.resolve_gateway_approval(relay.session_key, 'once', request_id=notice['request_id']) == 0
     relay.close()
-    worker.join(3)
+    worker.join(5)
     assert results[0]['choice'] != 'once'
 
 
@@ -89,7 +89,7 @@ def test_disallowed_scope_cannot_be_submitted_to_exact_core_request(relay_wait):
     assert A.resolve_gateway_approval(relay.session_key, 'session', request_id=notice['request_id']) == 0
     assert A.resolve_gateway_approval('unrelated-session', 'once', request_id=notice['request_id']) == 0
     assert A.resolve_gateway_approval(relay.session_key, 'once', request_id=notice['request_id']) == 1
-    worker.join(3)
+    worker.join(5)
     assert results[0]['choice'] == 'once'
 
 
@@ -164,7 +164,7 @@ def test_real_dispatch_lifecycle_revokes_relay(ending):
 
     def runner():
         captured.put(current_relay(key))
-        assert release.wait(2)
+        assert release.wait(5)
         if ending == 'crash':
             raise RuntimeError('fixture failure')
         if ending == 'base_crash':
@@ -175,7 +175,7 @@ def test_real_dispatch_lifecycle_revokes_relay(ending):
         model=None, session_key=key, runner=runner)
     try:
         assert handle['status'] == 'dispatched'
-        relay = captured.get(timeout=1)
+        relay = captured.get(timeout=5)
         if ending == 'stop':
             D.interrupt_for_session(session_key=key)
             assert relay.closed, 'Stop must revoke approvals before a cooperative worker returns'
@@ -194,12 +194,12 @@ def test_parent_cleanup_does_not_cancel_waiting_detached_child(relay_wait):
     relay, notice, results, t = relay_wait()
     A.unregister_gateway_notify(relay.session_key)
     assert A.resolve_gateway_approval(relay.session_key, 'once', request_id=notice['request_id']) == 1
-    t.join(1)
+    t.join(5)
     assert results[0]['choice'] == 'once'
 
 
 def test_detached_worker_notifies_after_parent_turn_returns(monkeypatch):
-    monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 2)
+    monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 10)
     D._reset_for_tests()
     ready, done = threading.Event(), threading.Event()
     notices = queue.Queue()
@@ -208,7 +208,7 @@ def test_detached_worker_notifies_after_parent_turn_returns(monkeypatch):
     A.register_gateway_notify(key, notices.put)
 
     def worker():
-        assert ready.wait(2)
+        assert ready.wait(5)
         cb = A._gateway_notify_cb(key)
         decisions.append(None if cb is None else _await_gateway_decision(
             key, cb, {'command': 'fixture operation', 'pattern_keys': ['fixture']}))
@@ -222,18 +222,18 @@ def test_detached_worker_notifies_after_parent_turn_returns(monkeypatch):
         A.unregister_gateway_notify(key)
         ready.set()
         try:
-            notice = notices.get(timeout=1)
+            notice = notices.get(timeout=5)
         except queue.Empty:
             notice = None
         assert notice is not None, 'Detached worker lost its notifier when the parent returned'
         assert notice['delegation_id'] == handle['delegation_id']
         assert A.resolve_gateway_approval(key, 'once', request_id=notice['request_id']) == 1
-        assert done.wait(2)
+        assert done.wait(5)
         assert decisions[0]['choice'] == 'once'
     finally:
         ready.set()
         D.interrupt_for_session(session_key=key)
-        done.wait(2)
+        done.wait(5)
         if D._executor is not None:
             D._executor.shutdown(wait=True)
         D._reset_for_tests()

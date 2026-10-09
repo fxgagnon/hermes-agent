@@ -99,6 +99,7 @@ def _make_prompt(chat_id="!testroom:matrix.org"):
         session_key="session-abc",
         chat_id=chat_id,
         message_id="$prompt-event-1",
+        request_id="request-fixture",
     )
 
 
@@ -110,7 +111,7 @@ def _run(adapter, event):
     adapter._redact_bot_approval_reactions = AsyncMock()
 
     fake_approval = types.ModuleType("tools.approval")
-    fake_approval.resolve_gateway_approval = lambda session_key, choice: 1
+    fake_approval.resolve_gateway_approval = lambda session_key, choice, **_kw: 1
     with patch.dict(sys.modules, {"tools.approval": fake_approval}):
         asyncio.run(adapter._on_reaction(event))
 
