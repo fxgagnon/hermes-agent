@@ -24,11 +24,13 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "data", "event", "reason", "result", "settle", "relay", "deadline")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = dict(data)
+        self.relay = None
+        self.deadline: float | None = None
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         # Surface hook run once when the wait ends by ANY path (answer, timeout, interrupt, /approve from
@@ -155,9 +157,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "session_key": session_key, "surface": surface,
     }
     keys = list(approval_data.get("pattern_keys") or [])
+    from tools.approval_relay import current_relay
+    relay = current_relay(session_key)
     with _approval._lock:
         leader = next((e for e in _approval._gateway_queues.get(session_key, [])
-                       if e.data.get("command") == approval_data.get("command")
+                       if relay is None and e.relay is None
+                       and e.data.get("command") == approval_data.get("command")
                        and list(e.data.get("pattern_keys") or []) == keys), None)
     if leader is not None and not preparing_terminal_approval():
         adopted = _await_coalesced_leader(session_key, leader, payload)
@@ -165,7 +170,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             return adopted
 
     entry = _ApprovalEntry(approval_data)
+    entry.relay = relay
+    if relay is not None:
+        entry.deadline = time.monotonic() + max(_ctx._get_approval_timeout(), 0)
     with _approval._lock:
+        if relay is not None and relay.closed:
+            return {"resolved": True, "choice": "deny", "reason": None}
         register_prepared_approval(session_key, entry)
         _approval._gateway_queues.setdefault(session_key, []).append(entry)
 
@@ -187,7 +197,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             # ``request.cancel`` carries a RequestCancelReason: a choice committed from another surface is
             # ``resolved``; a withdrawn entry (woken with no choice — session torn down, turn ended, client
             # cannot answer) is ``session_closed``; never the raw poll-state token "set".
-            if state == "set":
+            if state == "set" or (state == "timeout" and choice is not None):
                 reason = "resolved" if choice is not None else "session_closed"
             else:
                 reason = state
@@ -197,17 +207,20 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 logger.debug("approval settle hook failed", exc_info=True)
         return choice
 
+    from tools.approval_audit import record, best_effort
     from tools.human_input_hooks import human_input_request
     with human_input_request("approval", prompt=payload["command"], session_key=session_key) as human:
         # Plugins hear about the request before the gateway does (real-time observers).
         _ctx._fire_approval_hook("pre_approval_request", **payload)
         # Bridges sync agent thread → async gateway.
         try:
+            record(relay, 'request', request_id=entry.data['request_id'])
             notify_cb(dict(entry.data))
             approval_published()
         except Exception as exc:
             logger.warning("Gateway approval notify failed: %s", exc)
             _drop_entry("notify_failed")
+            best_effort(relay, 'settled', request_id=entry.data['request_id'], status='notify_failed')
             _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
             human.outcome = "notify_failed"
             return {"resolved": False, "choice": None, "notify_failed": True}
@@ -226,6 +239,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         # A choice that landed in the gap between the deadline check and leaving the queue is an answer,
         # not a timeout (#112548) — the same first-settlement rule as server_requests.send().
         resolved = state != "timeout" or choice is not None
+        best_effort(relay, 'settled', request_id=entry.data['request_id'],
+                    status='closed' if relay is not None and relay.closed else ('set' if resolved and state == 'timeout' else state))
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
         return _finish(payload, resolved, choice, entry.reason, **extra)

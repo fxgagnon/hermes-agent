@@ -17,6 +17,7 @@ import importlib
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 from utils import env_var_enabled, is_truthy_value
@@ -127,50 +128,96 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
-def unregister_gateway_notify(session_key: str) -> None:
-    """Unregister the callback and wake ALL blocked threads for this session so
-    they don't hang forever (agent run finished or interrupted)."""
+def unregister_gateway_notify(session_key: str, *, expected_cb=None) -> None:
+    """Release a turn notifier, not independently-owned detached requests.
+
+    ``expected_cb`` prevents an old turn's finally from removing a newer turn.
+    Session termination uses ``clear_session`` to revoke detached relays too.
+    """
     with _lock:
+        if expected_cb is not None and _gateway_notify_cbs.get(session_key) != expected_cb:
+            return
         _gateway_notify_cbs.pop(session_key, None)
-        for entry in _gateway_queues.pop(session_key, []):
+        queue = _gateway_queues.get(session_key, [])
+        entries = [e for e in queue if e.relay is None]
+        queue[:] = [e for e in queue if e.relay is not None]
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+        for entry in entries:
             entry.event.set()
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None, *, issuer: Optional[str] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
-    relayed to the agent in the BLOCKED message. Returns the number resolved.
+    relayed to the agent in the BLOCKED message. Returns how many waits received *choice*.
+
+    FIFO and ``all`` only reach turn-owned requests: a detached child's request is resolvable
+    solely through its own correlated card (``request_id``), so ``/approve`` keeps working for
+    the parent while a child waits.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
         if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
-            if not targets:
-                return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
-        elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = [entry for entry in queue
+                       if entry.data.get("request_id") == request_id and _relay_accepts(entry, choice)]
         else:
-            targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
-        # Popping the entry and committing its outcome are ONE critical section: the waiter's
-        # ``_drop_entry`` reads ``entry.result`` under this same lock after its deadline check, so a
-        # choice acked to the client here can never be popped-and-lost as a timeout (#112548).
-        for entry in targets:
-            entry.result = choice
-            if reason:
-                entry.reason = reason
-            entry.event.set()
-    return len(targets)
+            eligible = [entry for entry in queue if entry.relay is None]
+            targets = eligible if resolve_all else eligible[:1]
+        if not targets:
+            return 0
+        if all(entry.relay is None for entry in targets):
+            # Commit under the queue lock so deadline cleanup sees the answer (#112548).
+            _commit_locked(session_key, targets, dict.fromkeys(targets, choice), reason)
+            return len(targets)
+    # Detached decision: write the evidence (fsync) outside the global lock, then commit only
+    # what is still pending. A wait that timed out or was revoked meanwhile is not acked.
+    outcomes = {entry: _audited_choice(entry, choice, issuer) for entry in targets}
+    with _lock:
+        pending = _gateway_queues.get(session_key, [])
+        live = [entry for entry in targets if entry in pending]
+        _commit_locked(session_key, live, outcomes, reason)
+    return sum(1 for entry in live if outcomes[entry] == choice)
+
+
+def _relay_accepts(entry, choice: str) -> bool:
+    """Whether *choice* may resolve *entry*; detached requests also enforce their own deadline and tiers."""
+    if entry.relay is None:
+        return True
+    return (not entry.relay.closed and time.monotonic() < entry.deadline
+            and choice in ("once", "deny", "session", "always")
+            and (choice != "session" or entry.data.get("allow_session", True))
+            and (choice != "always" or entry.data.get("allow_permanent", True)))
+
+
+def _audited_choice(entry, choice: str, issuer: Optional[str]) -> str:
+    """*choice* once its decision evidence is durable; ``deny`` when it cannot be written."""
+    from tools.approval_audit import record
+    try:
+        record(entry.relay, "decision", request_id=entry.data["request_id"], choice=choice, issuer=issuer)
+    except (OSError, ValueError):
+        return "deny"  # no evidence, no permission
+    return choice
+
+
+def _commit_locked(session_key: str, targets: list, outcomes: dict, reason: Optional[str]) -> None:
+    """Remove *targets* from the session queue and wake each with its outcome. Caller holds ``_lock``."""
+    queue = _gateway_queues.get(session_key, [])
+    queue[:] = [entry for entry in queue if entry not in targets]
+    if not queue:
+        _gateway_queues.pop(session_key, None)
+    for entry in targets:
+        entry.result = outcomes[entry]
+        if reason:
+            entry.reason = reason
+        entry.event.set()
 
 
 def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> bool:
@@ -287,7 +334,10 @@ def clear_session(session_key: str) -> None:
     """Remove all approval and yolo state for a given session."""
     if not session_key:
         return
+    from tools.approval_relay import revoke_session_locked
     with _lock:
+        revoked = revoke_session_locked(session_key)
+        _gateway_notify_cbs.pop(session_key, None)
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
@@ -296,6 +346,8 @@ def clear_session(session_key: str) -> None:
             # the prompt was withdrawn, nobody denied it.
             entry.cancelled = "the session ended before the prompt was answered"
             entry.event.set()
+    for relay in revoked:
+        relay.audit_closed()
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
@@ -537,6 +589,10 @@ def _user_approved(session_key: str, description: str) -> dict:
 
 
 def _gateway_notify_cb(session_key: str):
+    from tools.approval_relay import current_relay
+    relay = current_relay(session_key)
+    if relay is not None:
+        return relay
     with _lock:
         return _gateway_notify_cbs.get(session_key)
 

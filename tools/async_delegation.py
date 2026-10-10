@@ -742,6 +742,7 @@ def _dispatch_admitted(
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
     crash_result = _batch_crash if is_batch else _single_crash
     dispatched_at = time.time()
+    from tools.approval_relay import capture_relay, run_with_relay
     record: dict[str, Any] = {
         "delegation_id": delegation_id, "goal": goal, **({"goals": list(goals)} if is_batch else {}),
         "context": context, "toolsets": list(toolsets) if toolsets else None, "role": role, "model": model,
@@ -763,9 +764,18 @@ def _dispatch_admitted(
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
             return {"status": "rejected", "error": capacity_error}
+        relay = capture_relay(session_key, delegation_id)
+        record["_approval_relay"] = relay
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except BaseException:
+        if relay is not None:
+            relay.close()
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        raise
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
     executor = _get_executor(max(max_async_children, live_units))
@@ -779,7 +789,7 @@ def _dispatch_admitted(
                 # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
                 rec.update(_started=True, _progress_ts=time.time())
         try:
-            result = runner() or {}
+            result = run_with_relay(relay, runner) or {}
             status = classify(result)
         except Exception as exc:
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
@@ -796,6 +806,8 @@ def _dispatch_admitted(
         future = executor.submit(propagate_context_to_thread(_worker))
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        if relay is not None:
+            relay.close()
         retirement.release()
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -887,6 +899,8 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         snapshot = dict(record)
+    if (relay := snapshot.get("_approval_relay")) is not None:
+        relay.close()
     _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
     with _records_lock:
         if delegation_id in _records:
@@ -1059,7 +1073,11 @@ def _stale_monitor_loop() -> None:
                            "(in_tool=%s) — interrupting; grace window %.0fs",
                            delegation_id, quiet_for, in_tool, _STALL_GRACE_SECONDS)
             with _records_lock:
-                fn = (_records.get(delegation_id) or {}).get("interrupt_fn")
+                record = _records.get(delegation_id) or {}
+                fn = record.get("interrupt_fn")
+                relay = record.get("_approval_relay")
+            if relay is not None:
+                relay.close()
             _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id)
         for delegation_id in expired:
             with _records_lock:
@@ -1164,6 +1182,9 @@ def list_async_delegations() -> list[dict[str, Any]]:
 
 def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str, msg: str) -> int:
     """Call ``interrupt_fn`` on each record; log ``msg`` once; returns how many succeeded."""
+    for record in targets:
+        if (relay := record.get("_approval_relay")) is not None:
+            relay.close()
     count = sum(
         _call_interrupt(r.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, r.get("delegation_id"))
         for r in targets)
